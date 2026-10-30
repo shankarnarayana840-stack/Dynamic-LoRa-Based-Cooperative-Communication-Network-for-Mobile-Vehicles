@@ -153,38 +153,9 @@ Confirm these values against the final firmware you intend to publish. They diff
 
 Slave nodes apply a randomized delay before transmitting their responses. The project has used a backoff interval between 100 ms and 1000 ms. Randomizing response times reduces the chance that multiple slaves transmit at exactly the same time after receiving a common discovery message. It reduces collision likelihood but does not guarantee collision-free communication.
 
-## 9. Experimental Setup and Results
 
-A scooter was used as a mobile platform to vary the separation between nodes. The direct communication test and two cooperative-search arrangements were examined using SF8 and SF9.
 
-### Case 1 – Direct communication
-
-The maximum observed distance at which the master received acknowledgements from all three slave nodes was:
-
-| Spreading factor | Maximum observed direct distance |
-|---|---:|
-| SF8 | Approximately 450 m |
-| SF9 | Approximately 470 m |
-
-These are observations from the specific test setup, not guaranteed LoRa ranges.
-
-### Case 2 – One responding node assists the search
-
-One responding slave was positioned approximately 450 m from the master. The other two nodes were approximately 250 m and 280 m from the responding node, under non-line-of-sight conditions. The master initiated the cooperative search through the responding node.
-
-### Case 3 – Two responding nodes assist the search
-
-Two slave nodes, approximately 450–460 m from the master, responded directly. The remaining node was approximately 250–300 m from one of the responding nodes. The cooperative search mechanism was used, and the master discovered all three slave nodes in this test scenario.
-
-### Bitrate and transmission-time analysis
-
-The experiments compared SF8 and SF9. Bitrate and packet transmission-time values were calculated using the radio parameters and packet lengths considered in the project. Since application payloads have different lengths, minimum, average, and maximum transmission-time values were considered rather than presenting only one value for every packet type. State clearly in the results whether a value is calculated from a formula or measured from the device.
-
-### LOS and NLOS observations
-
-A clear line-of-sight path generally supports better reception than an obstructed path. Obstacles can weaken the received signal and lead to intermittent reception or missed acknowledgements. A distance approaching 1 km was discussed as a possible LOS target, but it is not listed here as a measured result because the reported direct tests achieved approximately 450 m (SF8) and 470 m (SF9).
-
-## 10. Limitations
+## 9. Limitations
 
 - The prototype uses four nodes; behaviour with a larger network has not been evaluated.
 - The measured distances apply to the particular antennas, locations, radio settings, and test conditions used.
@@ -193,7 +164,7 @@ A clear line-of-sight path generally supports better reception than an obstructe
 - Security features such as encryption and authentication have not been implemented or evaluated.
 - The prototype should not be considered a field-ready military communication system.
 
-## 11. Future Work
+## 10. Future Work
 
 - Expand the network and evaluate the discovery mechanism with more nodes.
 - Improve node selection and route management using suitable link-quality or position information.
@@ -201,7 +172,7 @@ A clear line-of-sight path generally supports better reception than an obstructe
 - Test with multiple moving nodes under different LOS and NLOS conditions.
 - Add authentication and encryption for protected communication.
 
-## 12. Repository Structure
+## 11. Repository Structure
 
 
 
@@ -224,7 +195,7 @@ Dynamic-LoRa-Mesh-Network/
 
 
 
-## 13. Build and Run
+## 12. Build and Run
 
 1. Install Visual Studio Code and the ESP-IDF extension/toolchain for ESP32-C6.
 2. Open the master or slave ESP-IDF project directory.
@@ -237,6 +208,6 @@ Dynamic-LoRa-Mesh-Network/
 
 The exact build commands and project paths should be added after confirming the repository's final ESP-IDF project layout.
 
-## 14. Acknowledgement
+## 13. Acknowledgement
 
 This project was developed as an academic embedded-systems and wireless-communication prototype. The implementation and measurements are intended for learning and experimental evaluation.
