@@ -45,11 +45,7 @@ The purpose of the prototype is to investigate whether reachable nodes can help 
 
 The UART data lines are crossed: TX connects to RXD, and RX connects to TXD. Use the 3.3 V supply connection as specified for the board/module and verify the exact pinout and power requirements of the hardware revision before powering it.
 
-**Hardware image:** Add your actual assembled-node photograph and the wiring diagram to `Hardware/` and link them here, for example:
 
-```md
-![ESP32-C6 to RYLR998 wiring](Hardware/esp32c6_rylr998_wiring.png)
-```
 
 ## 4. Software and Development Tools
 
