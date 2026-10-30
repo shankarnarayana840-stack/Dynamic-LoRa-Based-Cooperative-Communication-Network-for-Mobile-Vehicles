@@ -218,11 +218,6 @@ Dynamic-LoRa-Mesh-Network/
 ├── Protocol/
 │   ├── packet_structure.md
 │   └── discovery_flowchart.png
-├── Experimental_Results/
-│   ├── observations.xlsx
-│   ├── sf8_results.png
-│   ├── sf9_results.png
-│   └── test_photos/
 └── Documentation/
     └── project_report.pdf
 ```
