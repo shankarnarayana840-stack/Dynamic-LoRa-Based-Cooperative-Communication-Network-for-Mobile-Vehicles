@@ -203,7 +203,7 @@ A clear line-of-sight path generally supports better reception than an obstructe
 
 ## 12. Repository Structure
 
-A suggested repository layout is:
+
 
 ```text
 Dynamic-LoRa-Mesh-Network/
@@ -229,7 +229,7 @@ Dynamic-LoRa-Mesh-Network/
     └── project_report.pdf
 ```
 
-Only add files that you have actually prepared. The folder layout is a recommendation; it does not imply that every listed file is already available.
+
 
 ## 13. Build and Run
 
