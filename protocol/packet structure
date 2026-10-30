@@ -1,1 +1,72 @@
+# 4.3 Packet Structure and Communication Protocol
 
+The proposed LoRa communication network uses application-level packets to manage node discovery, cooperative searching, acknowledgements, and forwarding operations. The ESP32-C6 processes these packets, while the Reyax RYLR998 module handles their wireless transmission and reception.
+
+### 1. RYLR998 Communication Frame
+
+The RYLR998 module uses an AT-command interface for transmitting messages.
+
+**Transmission format:**
+
+```text
+AT+SEND=<Destination_ID>,<Payload_Length>,<Payload>
+```
+
+**Reception format:**
+
+```text
++RCV=<Source_ID>,<Payload_Length>,<Payload>,<RSSI>,<SNR>
+```
+
+The destination and source addresses identify the communicating nodes. The payload length indicates the number of characters transmitted, while RSSI and SNR provide received radio-link information.
+
+### 2. Application-Level Packet Types
+
+The proposed protocol uses the following packet types:
+
+| Packet Type | Description |
+|---|---|
+| `DISCOVERY` | Broadcast message sent by the master to discover available nodes. |
+| `ACK_DISCOVERY` | Response sent by a slave node after receiving a discovery message. |
+| `SEARCH` | Request sent to a responding node to search for undiscovered nodes. |
+| `ACK_SEARCH` | Acknowledgement indicating receipt of a search request. |
+| `PROBE` | Message used to probe for the specified undiscovered nodes. |
+| `ACK_PROBE` | Response to a probe message. |
+| `RESULT:F:N` | Message used to communicate the outcome of the cooperative search. |
+| `FWD` | Message used for forwarding information between nodes. |
+| `ACK_FWD` | Acknowledgement for a forwarding message. |
+| `FWD_FAIL` | Indicates failure of a forwarding operation. |
+
+### 3. Example Packet Transmission
+
+The following example illustrates a search request transmitted from the master to Node 2.
+
+**Transmitted command:**
+
+```text
+AT+SEND=2,19,FWDS=3;SEARCH_REQ=1
+```
+
+**Module response:**
+
+```text
++OK
+```
+
+**Received acknowledgement:**
+
+```text
++RCV=2,10,ACK_SEARCH,-16,14
+```
+
+In this example, Node 2 acknowledges the search request sent by the master.
+
+### 4. Payload Length
+
+The application-level payload length varies according to the packet type and information being transmitted. The payloads generally range from 5 to 13 bytes in the tested protocol. The actual payload length is determined dynamically using the string length before transmission.
+
+### 5. Packet Communication
+
+The master initiates discovery by broadcasting `DISCOVERY` and collecting `ACK_DISCOVERY` responses. If some nodes remain undiscovered, it sends `SEARCH` requests to selected responding nodes. The cooperative search process uses `PROBE`, `ACK_PROBE`, and result messages to exchange discovery information. Forwarding-related packets manage message forwarding and its associated responses or failures.
+
+This packet-based mechanism coordinates communication between the master and slave nodes and supports the proposed cooperative node-discovery approach.
