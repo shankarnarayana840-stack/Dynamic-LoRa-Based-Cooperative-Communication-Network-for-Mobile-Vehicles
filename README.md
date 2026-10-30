@@ -1,4 +1,4 @@
-# Dynamic LoRa Mesh Network for Military Vehicle Communication
+#  Dynamic-LoRa-Based-Cooperative-Communication-Network-for-Mobile-Vehicles
 
 A four-node LoRa communication prototype built with **ESP32-C6** microcontrollers and **Reyax RYLR998** LoRa modules. The project explores master-coordinated node discovery and cooperative searching when some nodes cannot communicate directly with the master.
 
@@ -177,7 +177,7 @@ Slave nodes apply a randomized delay before transmitting their responses. The pr
 
 
 ```text
-Dynamic-LoRa-Mesh-Network/
+Dynamic-LoRa-Based-Cooperative-Communication-Network-for-Mobile-Vehicles/
 ├── README.md
 ├── Firmware/
 │   ├── Master_Node/
