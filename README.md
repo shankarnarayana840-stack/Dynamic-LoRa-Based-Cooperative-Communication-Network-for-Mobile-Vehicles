@@ -215,8 +215,6 @@ Dynamic-LoRa-Mesh-Network/
 │       └── main.c
 ├── Hardware/
 │   ├── esp32c6_rylr998_wiring.png
-│   ├── prototype_setup.jpg
-│   └── node_connections.md
 ├── Protocol/
 │   ├── packet_structure.md
 │   └── discovery_flowchart.png
