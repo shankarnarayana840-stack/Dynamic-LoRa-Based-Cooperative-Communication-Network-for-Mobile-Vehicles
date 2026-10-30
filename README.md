@@ -116,7 +116,7 @@ RX: +RCV=2,10,ACK_SEARCH,-16,14
 
 `+OK` indicates that the module accepted the send command; it is not, by itself, confirmation that the destination received the packet. `ACK_SEARCH` is the application-level acknowledgement.
 
-> **Packet-format consistency before release:** The master source file currently shared parses `ACK_DISCOVERY`, `ACK_SEARCH`, and `SEARCH_RESULT=...`, while the packet list above also names the result format `RESULT:F:N`. Standardize the exact result string and field meanings in both master and slave firmware before publishing the repository. Payload length varies by message. Check it using the actual payload string length; the example `FWDS=3;SEARCH_REQ=1` contains 19 ASCII characters, so not every example fits a 5–13-byte payload range.
+> 
 
 ## 7. Master Discovery and Cooperative Search
 
