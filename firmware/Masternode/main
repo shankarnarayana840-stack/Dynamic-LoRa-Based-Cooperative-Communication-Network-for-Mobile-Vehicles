@@ -1,1 +1,734 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
 
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#define TAG "MASTER"
+
+/* =========================================================
+   ADDRESSES
+   ========================================================= */
+
+#define MASTER_ADDRESS    4
+#define BROADCAST_ADDRESS 0
+
+#define NODE1_ADDRESS 1
+#define NODE2_ADDRESS 2
+#define NODE3_ADDRESS 3
+#define TOTAL_NODES   3
+
+/* =========================================================
+   DISCOVERY
+   ========================================================= */
+
+#define MAX_TRIES         2
+#define DISCOVERY_WAIT_MS 1500
+
+/* =========================================================
+   SEARCH (expanding search, master-driven)
+   ========================================================= */
+
+#define SEARCH_RETRIES          2
+#define SEARCH_ACK_WAIT_MS      1000
+#define SEARCH_RESULT_WAIT_MS   60000   /* keep > relay's worst case (targets x retries x PROBE_TIMEOUT_MS) */
+#define NEXT_KNOWN_NODE_WAIT_MS 1000
+#define MAX_SEARCH_ROUNDS       3
+#define BETWEEN_ROUND_WAIT_MS   2000
+
+/* =========================================================
+   DATA
+   ========================================================= */
+
+#define DATA_RETRIES       3
+#define DATA_ACK_WAIT_MS   1000
+#define FWD_RESULT_WAIT_MS 6000
+
+/* =========================================================
+   UART
+   ========================================================= */
+
+#define LORA_UART      UART_NUM_1
+#define LORA_TX_PIN    20
+#define LORA_RX_PIN    21
+#define LORA_BAUD_RATE 115200
+#define RX_BUF_SIZE    2048
+#define TX_BUF_SIZE    1024
+
+/* =========================================================
+   STATE
+   ========================================================= */
+
+static bool node1_found = false;
+static bool node2_found = false;
+static bool node3_found = false;
+
+static bool remotely_found_node1 = false;
+static bool remotely_found_node2 = false;
+static bool remotely_found_node3 = false;
+
+static int  route_via[TOTAL_NODES + 1];   /* index = node id; relay id, or -1 */
+static bool searched[TOTAL_NODES + 1];    /* true once a node has returned RESULT */
+
+static int unresponded_nodes[TOTAL_NODES];
+static int unresponded_count = 0;
+
+static bool search_ack_received = false;
+static bool search_result_received = false;
+
+static int current_search_destination = -1;  /* first hop: who ACKs and returns RESULT */
+static int current_searcher = -1;            /* node that actually probes (may be remote) */
+
+static volatile int data_ack_from = -1;
+static volatile int fwd_ack_node  = -1;
+static volatile int fwd_fail_node = -1;
+
+/* =========================================================
+   UART INITIALIZATION
+   ========================================================= */
+
+static void lora_uart_init(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = LORA_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT
+    };
+
+    ESP_ERROR_CHECK(uart_driver_install(LORA_UART, RX_BUF_SIZE, TX_BUF_SIZE, 0, NULL, 0));
+    ESP_ERROR_CHECK(uart_param_config(LORA_UART, &uart_config));
+    ESP_ERROR_CHECK(uart_set_pin(LORA_UART, LORA_TX_PIN, LORA_RX_PIN,
+                                 UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
+
+    ESP_LOGI(TAG, "LoRa UART initialized");
+}
+
+/* =========================================================
+   HELPERS
+   ========================================================= */
+
+static bool node_is_direct(int id)
+{
+    return (id == 1 && node1_found) ||
+           (id == 2 && node2_found) ||
+           (id == 3 && node3_found);
+}
+
+static bool node_is_remote(int id)
+{
+    return (id == 1 && remotely_found_node1) ||
+           (id == 2 && remotely_found_node2) ||
+           (id == 3 && remotely_found_node3);
+}
+
+static bool node_unresolved(int id)
+{
+    return !node_is_direct(id) && !node_is_remote(id);
+}
+
+static int get_remaining_unresolved_count(void)
+{
+    int count = 0;
+    for (int id = 1; id <= TOTAL_NODES; id++)
+        if (node_unresolved(id)) count++;
+    return count;
+}
+
+/* =========================================================
+   SEND
+   ========================================================= */
+
+static void lora_send_command(const char *command)
+{
+    char buffer[256];
+    snprintf(buffer, sizeof(buffer), "%s\r\n", command);
+    uart_write_bytes(LORA_UART, buffer, strlen(buffer));
+    ESP_LOGI(TAG, "AT: %s", command);
+}
+
+static void lora_send(int destination, const char *payload)
+{
+    char command[256];
+    snprintf(command, sizeof(command), "AT+SEND=%d,%d,%s",
+             destination, (int)strlen(payload), payload);
+    lora_send_command(command);
+}
+
+/* =========================================================
+   PROCESS RECEIVED LINE
+
+   Payloads must not contain commas (module uses commas as
+   field separators). Use ':' and ';' inside payloads.
+   ========================================================= */
+
+static void process_received_line(char *line)
+{
+    int sender;
+    int length;
+    char data[150];
+
+    memset(data, 0, sizeof(data));
+
+    int result = sscanf(line, "+RCV=%d,%d,%149[^,]", &sender, &length, data);
+    if (result != 3)
+        return;
+
+    ESP_LOGI(TAG, "Received from %d : %s", sender, data);
+
+    /* ---------- discovery ack ---------- */
+    if (strcmp(data, "ACK_DISCOVERY") == 0)
+    {
+        if (sender == NODE1_ADDRESS)      { node1_found = true; ESP_LOGI(TAG, "NODE 1 ACK RECEIVED"); }
+        else if (sender == NODE2_ADDRESS) { node2_found = true; ESP_LOGI(TAG, "NODE 2 ACK RECEIVED"); }
+        else if (sender == NODE3_ADDRESS) { node3_found = true; ESP_LOGI(TAG, "NODE 3 ACK RECEIVED"); }
+        return;
+    }
+
+    /* ---------- search ack ---------- */
+    if (strcmp(data, "ACK_SEARCH") == 0)
+    {
+        if (sender == current_search_destination)
+        {
+            search_ack_received = true;
+            ESP_LOGI(TAG, "SEARCH ACK RECEIVED FROM NODE %d", sender);
+        }
+        return;
+    }
+
+    /* ---------- search result: RESULT:F:<found ids>:N:<not-found ids> ---------- */
+    if (strncmp(data, "RESULT:F", 8) == 0)
+    {
+        if (sender != current_search_destination)
+            return;
+
+        search_result_received = true;
+        if (current_searcher >= 1 && current_searcher <= TOTAL_NODES)
+            searched[current_searcher] = true;
+
+        char *p = data + 8;                 /* e.g. ":2:3:N:1" */
+        char *n = strstr(p, ":N");
+        if (n != NULL)
+            *n = '\0';                      /* cut off the not-found part */
+
+        if (*p == '\0')
+        {
+            ESP_LOGI(TAG, "NODE %d FOUND NONE OF THE REQUESTED NODES", current_searcher);
+            return;
+        }
+
+        char *token = strtok(p, ":");
+        while (token != NULL)
+        {
+            int found_node = atoi(token);
+
+            if (found_node >= 1 && found_node <= TOTAL_NODES &&
+                node_unresolved(found_node))
+            {
+                if (found_node == NODE1_ADDRESS)      remotely_found_node1 = true;
+                else if (found_node == NODE2_ADDRESS) remotely_found_node2 = true;
+                else                                  remotely_found_node3 = true;
+
+                route_via[found_node] = current_searcher;
+                ESP_LOGI(TAG, "NODE %d FOUND THROUGH NODE %d", found_node, current_searcher);
+            }
+
+            token = strtok(NULL, ":");
+        }
+        return;
+    }
+
+    /* ---------- data acks ---------- */
+    if (strcmp(data, "ACK_DATA") == 0)      { data_ack_from = sender; return; }
+    if (strncmp(data, "ACK_FWD=", 8) == 0)  { fwd_ack_node  = atoi(data + 8); return; }
+    if (strncmp(data, "FWD_FAIL=", 9) == 0) { fwd_fail_node = atoi(data + 9); return; }
+}
+
+/* =========================================================
+   BUILD SEARCH REQUEST  ->  SEARCH_REQ=1:2:3
+   ========================================================= */
+
+static int build_search_request(char *buffer, size_t buffer_size)
+{
+    int count = 0;
+    int offset = snprintf(buffer, buffer_size, "SEARCH_REQ=");
+
+    for (int id = 1; id <= TOTAL_NODES; id++)
+    {
+        if (node_unresolved(id) && offset < (int)buffer_size)
+        {
+            offset += snprintf(buffer + offset, buffer_size - offset,
+                               "%s%d", count == 0 ? "" : ":", id);
+            count++;
+        }
+    }
+
+    return count;
+}
+
+/* =========================================================
+   RECEIVE UART DATA (static buffer so split lines survive)
+   ========================================================= */
+
+static void lora_receive(void)
+{
+    static char line_buffer[256];
+    static int  line_index = 0;
+    uint8_t rx_buffer[256];
+
+    while (1)
+    {
+        int len = uart_read_bytes(LORA_UART, rx_buffer, sizeof(rx_buffer), 100);
+        if (len <= 0)
+            return;
+
+        for (int i = 0; i < len; i++)
+        {
+            char c = rx_buffer[i];
+
+            if (c == '\r' || c == '\n')
+            {
+                if (line_index > 0)
+                {
+                    line_buffer[line_index] = '\0';
+                    ESP_LOGI(TAG, "RAW RX: %s", line_buffer);
+                    process_received_line(line_buffer);
+                    line_index = 0;
+                }
+            }
+            else if (line_index < (int)sizeof(line_buffer) - 1)
+            {
+                line_buffer[line_index++] = c;
+            }
+            else
+            {
+                line_index = 0;
+            }
+        }
+    }
+}
+
+/* =========================================================
+   WHO CAN BE ASKED TO SEARCH THIS ROUND
+
+   1. direct nodes that have not answered yet
+   2. remote nodes (found through a DIRECT relay) that have
+      not searched yet  -> max 2 hops
+   ========================================================= */
+
+static int build_searcher_list(int *list)
+{
+    int n = 0;
+
+    for (int id = 1; id <= TOTAL_NODES; id++)
+        if (node_is_direct(id) && !searched[id])
+            list[n++] = id;
+
+    for (int id = 1; id <= TOTAL_NODES; id++)
+        if (!node_is_direct(id) && route_via[id] > 0 &&
+            node_is_direct(route_via[id]) && !searched[id])
+            list[n++] = id;
+
+    return n;
+}
+
+/* =========================================================
+   ONE PASS OVER THE SEARCHER LIST
+   ========================================================= */
+
+static void perform_search_round(int *searchers, int count, int round_number)
+{
+    char search_command[150];
+    char req[100];
+
+    ESP_LOGI(TAG, "------------------------------");
+    ESP_LOGI(TAG, "SEARCH ROUND %d", round_number);
+    ESP_LOGI(TAG, "------------------------------");
+
+    for (int k = 0; k < count; k++)
+    {
+        int searcher = searchers[k];
+        int hop = node_is_direct(searcher) ? searcher : route_via[searcher];
+
+        if (get_remaining_unresolved_count() == 0)
+        {
+            ESP_LOGI(TAG, "All previously unresponded nodes have been found.");
+            break;
+        }
+
+        if (hop <= 0)
+            continue;
+
+        current_searcher = searcher;
+        current_search_destination = hop;
+
+        if (build_search_request(req, sizeof(req)) == 0)
+            break;
+
+        if (node_is_direct(searcher))
+            snprintf(search_command, sizeof(search_command), "%s", req);
+        else
+            snprintf(search_command, sizeof(search_command), "FWDS=%d;%s", searcher, req);
+
+        ESP_LOGI(TAG, "------------------------------");
+        ESP_LOGI(TAG, "Asking node %d to search (first hop: node %d)", searcher, hop);
+        ESP_LOGI(TAG, "SEARCH REQUEST = %s", search_command);
+
+        /* ---------- send + wait for ACK_SEARCH ---------- */
+        bool acknowledged = false;
+
+        for (int attempt = 0; attempt <= SEARCH_RETRIES; attempt++)
+        {
+            search_ack_received = false;
+            search_result_received = false;
+
+            ESP_LOGI(TAG, "SEARCH ATTEMPT %d/%d -> NODE %d",
+                     attempt + 1, SEARCH_RETRIES + 1, hop);
+
+            lora_send(hop, search_command);
+
+            TickType_t start = xTaskGetTickCount();
+            while (pdTICKS_TO_MS(xTaskGetTickCount() - start) < SEARCH_ACK_WAIT_MS)
+            {
+                lora_receive();
+                if (search_ack_received)
+                {
+                    acknowledged = true;
+                    break;
+                }
+            }
+
+            if (acknowledged)
+                break;
+
+            if (attempt < SEARCH_RETRIES)
+            {
+                ESP_LOGI(TAG, "NO ACK FROM NODE %d - RETRYING", hop);
+                vTaskDelay(pdMS_TO_TICKS(500));
+            }
+        }
+
+        if (!acknowledged)
+        {
+            ESP_LOGI(TAG, "NODE %d DID NOT ACK AFTER %d ATTEMPTS", hop, SEARCH_RETRIES + 1);
+            vTaskDelay(pdMS_TO_TICKS(NEXT_KNOWN_NODE_WAIT_MS));
+            continue;
+        }
+
+        /* ---------- wait for RESULT ---------- */
+        ESP_LOGI(TAG, "Waiting for RESULT (searcher %d) from node %d...", searcher, hop);
+
+        TickType_t start = xTaskGetTickCount();
+        while (pdTICKS_TO_MS(xTaskGetTickCount() - start) < SEARCH_RESULT_WAIT_MS)
+        {
+            lora_receive();
+            if (search_result_received)
+                break;
+        }
+
+        if (search_result_received)
+            ESP_LOGI(TAG, "SEARCH RESULT RECEIVED (searcher %d)", searcher);
+        else
+            ESP_LOGI(TAG, "NO SEARCH RESULT (searcher %d)", searcher);
+
+        if (k < count - 1 && get_remaining_unresolved_count() > 0)
+            vTaskDelay(pdMS_TO_TICKS(NEXT_KNOWN_NODE_WAIT_MS));
+    }
+
+    ESP_LOGI(TAG, "SEARCH ROUND %d COMPLETE -- %d node(s) still unresolved",
+             round_number, get_remaining_unresolved_count());
+}
+
+/* =========================================================
+   EXPANDING SEARCH
+
+   Round 1: direct nodes search.
+   Round 2+: nodes found remotely in earlier rounds search too
+   (through their relay). Stops when nothing is missing or
+   nobody is left to ask.
+   ========================================================= */
+
+static void search_unresponded_nodes_via_known_nodes(void)
+{
+    for (int i = 0; i <= TOTAL_NODES; i++)
+    {
+        route_via[i] = -1;
+        searched[i] = false;
+    }
+
+    remotely_found_node1 = false;
+    remotely_found_node2 = false;
+    remotely_found_node3 = false;
+
+    ESP_LOGI(TAG, "==============================");
+    ESP_LOGI(TAG, "SECOND STAGE SEARCH");
+    ESP_LOGI(TAG, "==============================");
+
+    if (unresponded_count == 0)
+    {
+        ESP_LOGI(TAG, "No unresponded nodes. No secondary search required.");
+        return;
+    }
+
+    int probe[TOTAL_NODES];
+    if (build_searcher_list(probe) == 0)
+    {
+        ESP_LOGI(TAG, "No known nodes available to perform secondary search.");
+        return;
+    }
+
+    for (int round = 1; round <= MAX_SEARCH_ROUNDS; round++)
+    {
+        int list[TOTAL_NODES];
+        int n = build_searcher_list(list);
+
+        if (n == 0)
+        {
+            ESP_LOGI(TAG, "No searcher nodes left to ask. Stopping.");
+            break;
+        }
+
+        perform_search_round(list, n, round);
+
+        if (get_remaining_unresolved_count() == 0)
+        {
+            ESP_LOGI(TAG, "All nodes resolved after round %d -- stopping early.", round);
+            break;
+        }
+
+        if (round < MAX_SEARCH_ROUNDS)
+        {
+            ESP_LOGI(TAG, "Nodes still unresolved after round %d. Next round...", round);
+            vTaskDelay(pdMS_TO_TICKS(BETWEEN_ROUND_WAIT_MS));
+        }
+        else
+        {
+            ESP_LOGI(TAG, "Reached MAX_SEARCH_ROUNDS (%d). Giving up on remaining nodes.",
+                     MAX_SEARCH_ROUNDS);
+        }
+    }
+
+    ESP_LOGI(TAG, "==============================");
+    ESP_LOGI(TAG, "FINAL SEARCH RESULT");
+    for (int id = 1; id <= TOTAL_NODES; id++)
+    {
+        if (node_is_direct(id))      ESP_LOGI(TAG, "NODE %d : DIRECTLY FOUND", id);
+        else if (node_is_remote(id)) ESP_LOGI(TAG, "NODE %d : FOUND THROUGH ANOTHER NODE", id);
+        else                         ESP_LOGI(TAG, "NODE %d : MISSING", id);
+    }
+    ESP_LOGI(TAG, "==============================");
+}
+
+/* =========================================================
+   ROUTING TABLE
+   ========================================================= */
+
+static void print_routing_table(void)
+{
+    ESP_LOGI(TAG, "========== ROUTING TABLE ==========");
+
+    for (int id = 1; id <= TOTAL_NODES; id++)
+    {
+        int p = route_via[id];
+
+        if (node_is_direct(id))
+            ESP_LOGI(TAG, "Node %d -> DIRECT", id);
+        else if (p > 0 && node_is_direct(p))
+            ESP_LOGI(TAG, "Node %d -> VIA NODE %d", id, p);
+        else if (p > 0 && route_via[p] > 0)
+            ESP_LOGI(TAG, "Node %d -> VIA NODE %d -> NODE %d", id, route_via[p], p);
+        else
+            ESP_LOGI(TAG, "Node %d -> UNREACHABLE", id);
+    }
+
+    ESP_LOGI(TAG, "===================================");
+}
+
+/* =========================================================
+   PREPARE UNRESPONDED NODES
+   ========================================================= */
+
+static void prepare_unresponded_nodes(void)
+{
+    unresponded_count = 0;
+
+    for (int id = 1; id <= TOTAL_NODES; id++)
+        if (!node_is_direct(id))
+            unresponded_nodes[unresponded_count++] = id;
+
+    ESP_LOGI(TAG, "==============================");
+    ESP_LOGI(TAG, "UNRESPONDED NODES");
+
+    if (unresponded_count == 0)
+        ESP_LOGI(TAG, "All nodes responded");
+    else
+        for (int i = 0; i < unresponded_count; i++)
+            ESP_LOGI(TAG, "Unresponded Node = %d", unresponded_nodes[i]);
+
+    ESP_LOGI(TAG, "==============================");
+}
+
+/* =========================================================
+   DISCOVERY
+   ========================================================= */
+
+static void discovery_process(void)
+{
+    node1_found = false;
+    node2_found = false;
+    node3_found = false;
+
+    ESP_LOGI(TAG, "==============================");
+    ESP_LOGI(TAG, "STARTING DISCOVERY");
+    ESP_LOGI(TAG, "==============================");
+
+    lora_send(BROADCAST_ADDRESS, "DISCOVERY");
+    ESP_LOGI(TAG, "Waiting for node ACKs...");
+
+    int elapsed = 0;
+    while (elapsed < DISCOVERY_WAIT_MS)
+    {
+        lora_receive();
+        vTaskDelay(pdMS_TO_TICKS(100));
+        elapsed += 100;
+    }
+
+    ESP_LOGI(TAG, "DISCOVERY RESULT");
+    for (int id = 1; id <= TOTAL_NODES; id++)
+        ESP_LOGI(TAG, "Node %d : %s", id, node_is_direct(id) ? "FOUND" : "NOT FOUND");
+    ESP_LOGI(TAG, "==============================");
+}
+
+/* =========================================================
+   SEND USER DATA (direct, or through ONE relay)
+   ========================================================= */
+
+static bool send_user_data(int id, const char *msg)
+{
+    char payload[150];
+
+    if (node_is_direct(id))
+    {
+        snprintf(payload, sizeof(payload), "DATA=%s", msg);
+
+        for (int a = 0; a < DATA_RETRIES; a++)
+        {
+            data_ack_from = -1;
+            lora_send(id, payload);
+
+            TickType_t t0 = xTaskGetTickCount();
+            while (pdTICKS_TO_MS(xTaskGetTickCount() - t0) < DATA_ACK_WAIT_MS)
+            {
+                lora_receive();
+                if (data_ack_from == id) return true;
+            }
+        }
+        return false;
+    }
+
+    int relay = (id >= 1 && id <= TOTAL_NODES) ? route_via[id] : -1;
+
+    if (relay <= 0)
+    {
+        ESP_LOGI(TAG, "Node %d is unreachable", id);
+        return false;
+    }
+
+    if (!node_is_direct(relay))
+    {
+        ESP_LOGI(TAG, "Node %d is 2 hops away (via %d via %d): data forwarding not implemented yet",
+                 id, relay, route_via[relay]);
+        return false;
+    }
+
+    snprintf(payload, sizeof(payload), "FWD=%d:%s", id, msg);
+    ESP_LOGI(TAG, "Sending to node %d via node %d", id, relay);
+
+    for (int a = 0; a < DATA_RETRIES; a++)
+    {
+        fwd_ack_node = fwd_fail_node = -1;
+        lora_send(relay, payload);
+
+        TickType_t t0 = xTaskGetTickCount();
+        while (pdTICKS_TO_MS(xTaskGetTickCount() - t0) < FWD_RESULT_WAIT_MS)
+        {
+            lora_receive();
+            if (fwd_ack_node == id)  return true;
+            if (fwd_fail_node == id) return false;
+        }
+    }
+    return false;
+}
+
+/* =========================================================
+   USER INPUT   ("3 hello"  or  "r" for routing table)
+   ========================================================= */
+
+static void user_input_loop(void)
+{
+    char line[160];
+
+    while (1)
+    {
+        printf("\nEnter: <node id> <message>   e.g.  3 hello   (r = routing table)\n> ");
+        fflush(stdout);
+
+        while (fgets(line, sizeof(line), stdin) == NULL)
+        {
+            clearerr(stdin);
+            vTaskDelay(pdMS_TO_TICKS(100));
+        }
+
+        line[strcspn(line, "\r\n")] = '\0';
+
+        if (strcmp(line, "r") == 0)
+        {
+            print_routing_table();
+            continue;
+        }
+
+        int id = atoi(line);
+        char *msg = strchr(line, ' ');
+
+        if (id < 1 || id > TOTAL_NODES || msg == NULL || msg[1] == '\0')
+        {
+            printf("Format: <1-3> <message>\n");
+            continue;
+        }
+
+        bool ok = send_user_data(id, msg + 1);
+        printf("Node %d : %s\n", id, ok ? "DELIVERED" : "FAILED");
+    }
+}
+
+/* =========================================================
+   MAIN
+   ========================================================= */
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "MASTER STARTING");
+    ESP_LOGI(TAG, "Master address = %d", MASTER_ADDRESS);
+
+    lora_uart_init();
+
+    for (int try = 1; try <= MAX_TRIES; try++)
+    {
+        ESP_LOGI(TAG, "DISCOVERY ATTEMPT %d/%d", try, MAX_TRIES);
+        discovery_process();
+
+        if (try < MAX_TRIES)
+            vTaskDelay(pdMS_TO_TICKS(5000));
+    }
+
+        prepare_unresponded_nodes();
+    search_unresponded_nodes_via_known_nodes();
+    print_routing_table();
+    user_input_loop();
+}
