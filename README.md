@@ -85,7 +85,7 @@ The application protocol uses the following message names:
 |---|---|
 | `DISCOVERY` | Master broadcast used to discover reachable slave nodes. |
 | `ACK_DISCOVERY` | Slave acknowledgement for a discovery message. |
-| `SEARCH` | Request for a responding node to search for specified undiscovered nodes. |
+| `SEARCH_REQ` | Request for a responding node to search for specified undiscovered nodes. |
 | `ACK_SEARCH` | Acknowledgement of a search request. |
 | `PROBE` | Probe message used as part of the delegated search procedure. |
 | `ACK_PROBE` | Response to a probe message. |
