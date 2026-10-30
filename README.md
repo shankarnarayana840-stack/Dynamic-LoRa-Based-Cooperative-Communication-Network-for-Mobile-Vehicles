@@ -178,19 +178,20 @@ Slave nodes apply a randomized delay before transmitting their responses. The pr
 
 ```text
 Dynamic-LoRa-Based-Cooperative-Communication-Network-for-Mobile-Vehicles/
-├── README.md
+├── Hardware/
+│   ├── esp32c6_rylr998_wiring.png
+└── Documentation/
+    └── project_report.pdf
 ├── Firmware/
 │   ├── Master_Node/
 │   │   └── main.c
 │   └── Slave_Node/
 │       └── main.c
-├── Hardware/
-│   ├── esp32c6_rylr998_wiring.png
 ├── Protocol/
 │   ├── packet_structure.md
 │   └── discovery_flowchart.png
-└── Documentation/
-    └── project_report.pdf
+├── README.md
+
 ```
 
 
