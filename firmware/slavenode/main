@@ -1,1 +1,751 @@
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+#include <stdbool.h>
 
+#include "driver/uart.h"
+#include "esp_log.h"
+#include "esp_random.h"
+#include "esp_rom_sys.h"
+#include "esp_timer.h"
+
+#define TAG "NODE"
+
+/* =========================================================
+   CHANGE THIS
+
+   Node 1 -> 1
+   Node 2 -> 2
+   Node 3 -> 3
+   ========================================================= */
+
+#define MY_ADDRESS 1
+
+/* =========================================================
+   MASTER
+   ========================================================= */
+
+#define MASTER_ADDRESS 4
+
+/* =========================================================
+   UART
+   ========================================================= */
+
+#define LORA_UART      UART_NUM_1
+#define LORA_TX_PIN    20
+#define LORA_RX_PIN    21
+#define LORA_BAUD_RATE 115200
+
+#define RX_BUF_SIZE    2048
+#define TX_BUF_SIZE    1024
+
+/* =========================================================
+   RANDOM BACKOFF (discovery ack)
+
+   Sized from ToA of ACK_DISCOVERY (~7.2ms) x margin x N_slaves.
+   Tune BACKOFF_MAX_MS from your measured ToA, not a guess.
+   ========================================================= */
+
+#define BACKOFF_MIN_MS 10
+#define BACKOFF_MAX_MS 400
+
+/* =========================================================
+   CASE 2: RELAY-BASED SEARCH CONFIG
+   ========================================================= */
+
+#define MAX_TARGETS         3     /* max unresponded nodes in one SEARCH */
+#define PROBE_MAX_RETRIES   5    /* retries per target node before giving up */
+#define PROBE_TIMEOUT_MS    5000   /* time to wait for ACK_PROBE per attempt */
+#define DATA_MAX_RETRIES 3
+#define DATA_TIMEOUT_MS 1000
+#define REMOTE_RESULT_WAIT_MS 40000
+/* =========================================================
+   UART INITIALIZATION
+   ========================================================= */
+
+static void lora_uart_init(void)
+{
+    const uart_config_t uart_config = {
+        .baud_rate = LORA_BAUD_RATE,
+        .data_bits = UART_DATA_8_BITS,
+        .parity = UART_PARITY_DISABLE,
+        .stop_bits = UART_STOP_BITS_1,
+        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
+        .source_clk = UART_SCLK_DEFAULT
+    };
+
+    ESP_ERROR_CHECK(
+        uart_driver_install(
+            LORA_UART,
+            RX_BUF_SIZE,
+            TX_BUF_SIZE,
+            0,
+            NULL,
+            0
+        )
+    );
+
+    ESP_ERROR_CHECK(
+        uart_param_config(
+            LORA_UART,
+            &uart_config
+        )
+    );
+
+    ESP_ERROR_CHECK(
+        uart_set_pin(
+            LORA_UART,
+            LORA_TX_PIN,
+            LORA_RX_PIN,
+            UART_PIN_NO_CHANGE,
+            UART_PIN_NO_CHANGE
+        )
+    );
+
+    ESP_LOGI(TAG, "LoRa UART initialized");
+}
+
+
+/* =========================================================
+   SEND AT COMMAND
+   ========================================================= */
+
+static void lora_send_command(const char *command)
+{
+    char buffer[256];
+
+    snprintf(
+        buffer,
+        sizeof(buffer),
+        "%s\r\n",
+        command
+    );
+
+    uart_write_bytes(
+        LORA_UART,
+        buffer,
+        strlen(buffer)
+    );
+
+    ESP_LOGI(TAG, "AT: %s", command);
+}
+
+
+/* =========================================================
+   SEND LORA PACKET
+   ========================================================= */
+
+static void lora_send(
+    int destination,
+    const char *payload
+)
+{
+    char command[256];
+
+    snprintf(
+        command,
+        sizeof(command),
+        "AT+SEND=%d,%d,%s",
+        destination,
+        (int)strlen(payload),
+        payload
+    );
+
+    lora_send_command(command);
+
+    ESP_LOGI(
+        TAG,
+        "Sent to %d: %s",
+        destination,
+        payload
+    );
+}
+
+
+/* =========================================================
+   SEND DISCOVERY ACK
+   ========================================================= */
+
+static void send_discovery_ack(void)
+{
+    lora_send(
+        MASTER_ADDRESS,
+        "ACK_DISCOVERY"
+    );
+}
+
+
+/* =========================================================
+   SEND PROBE ACK (to whichever slave probed us, not master)
+   ========================================================= */
+
+static void send_probe_ack(int requester_address)
+{
+    lora_send(
+        requester_address,
+        "ACK_PROBE"
+    );
+   
+}
+
+
+/* =========================================================
+   RAW LINE READER (single attempt, non-blocking-ish)
+
+   Reads whatever is currently in the UART buffer and extracts
+   ONE complete line if present. Returns true if a line was found.
+   ========================================================= */
+
+static bool read_one_line(char *line_buffer, size_t buffer_size)
+{
+    uint8_t rx_buffer[256];
+    int line_index = 0;
+
+    int len = uart_read_bytes(
+        LORA_UART,
+        rx_buffer,
+        sizeof(rx_buffer),
+        100
+    );
+
+    if (len <= 0)
+    {
+        return false;
+    }
+
+    for (int i = 0; i < len; i++)
+    {
+        char c = rx_buffer[i];
+
+        if (c == '\r' || c == '\n')
+        {
+            if (line_index > 0)
+            {
+                line_buffer[line_index] = '\0';
+
+                ESP_LOGI(
+                    TAG,
+                    "RAW RX: %s",
+                    line_buffer
+                );
+
+                return true;
+            }
+        }
+        else
+        {
+            if (line_index < (int)(buffer_size - 1))
+            {
+                line_buffer[line_index++] = c;
+            }
+            else
+            {
+                line_index = 0;
+            }
+        }
+    }
+
+    return false;
+}
+
+
+/* =========================================================
+   BLOCKING WAIT FOR A LINE, WITH TIMEOUT
+
+   Used by the relay while probing an unresponded node: it needs
+   to actively wait for ACK_PROBE instead of just polling once.
+   ========================================================= */
+
+static bool wait_for_line(
+    char *line_buffer,
+    size_t buffer_size,
+    uint32_t timeout_ms
+)
+{
+    uint32_t waited_ms = 0;
+    const uint32_t poll_step_ms = 20;
+
+    while (waited_ms < timeout_ms)
+    {
+        if (read_one_line(line_buffer, buffer_size))
+        {
+            return true;
+        }
+
+        esp_rom_delay_us(poll_step_ms * 1000);
+        waited_ms += poll_step_ms;
+    }
+
+    return false;
+}
+
+
+/* =========================================================
+   PARSE "SEARCH:2:3" INTO A LIST OF NODE IDS
+   ========================================================= */
+
+static int parse_target_list(
+    const char *search_payload,
+    int *targets
+)
+{
+    char buf[100];
+
+    strncpy(buf, search_payload, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    int count = 0;
+
+    /* buf looks like "SEARCH_REQ=2,3" */
+
+    char *list = strchr(buf, '=');
+
+    if (list == NULL)
+        return 0;
+
+    list++;   // move past '='
+
+    char *token = strtok(list, ":");
+
+    while (token != NULL && count < MAX_TARGETS)
+    {
+        targets[count++] = atoi(token);
+        token = strtok(NULL, ":");
+    }
+
+    return count;
+}
+static bool send_data_with_ack(int dest, const char *payload)
+{
+    for (int a = 1; a <= DATA_MAX_RETRIES; a++)
+    {
+        lora_send(dest, payload);
+        esp_rom_delay_us(3000);
+
+        int64_t deadline = esp_timer_get_time() + (int64_t)DATA_TIMEOUT_MS * 1000;
+
+        while (esp_timer_get_time() < deadline)
+        {
+            char line[256];
+            if (!wait_for_line(line, sizeof(line), 200)) continue;
+
+            int s, l;
+            char d[64] = {0};
+
+            if (sscanf(line, "+RCV=%d,%d,%63[^,]", &s, &l, d) == 3 &&
+                s == dest && strcmp(d, "ACK_DATA") == 0)
+                return true;
+        }
+    }
+    return false;
+}
+///handling forward search packets
+
+static void handle_fwd_search(const char *data)
+{
+    int searcher = atoi(data + 5);
+    const char *req = strchr(data, ';');
+    if (req == NULL) return;
+    req++;
+
+    lora_send(MASTER_ADDRESS, "ACK_SEARCH");
+
+    char result[150] = "RESULT:F:N";      /* default: found nothing */
+    bool got_ack = false;
+
+    for (int a = 0; a < 3 && !got_ack; a++)
+    {
+        lora_send(searcher, req);
+        int64_t dl = esp_timer_get_time() + 1500 * 1000LL;
+        while (!got_ack && esp_timer_get_time() < dl)
+        {
+            char line[256], d[128] = {0};
+            int s, l;
+            if (!wait_for_line(line, sizeof(line), 200)) continue;
+            if (sscanf(line, "+RCV=%d,%d,%127[^,]", &s, &l, d) == 3 &&
+                s == searcher && strcmp(d, "ACK_SEARCH") == 0)
+                got_ack = true;
+        }
+    }
+
+    if (got_ack)
+    {
+        bool done = false;
+        int64_t dl = esp_timer_get_time() + (int64_t)REMOTE_RESULT_WAIT_MS * 1000;
+        while (!done && esp_timer_get_time() < dl)
+        {
+            char line[256], d[128] = {0};
+            int s, l;
+            if (!wait_for_line(line, sizeof(line), 200)) continue;
+            if (sscanf(line, "+RCV=%d,%d,%127[^,]", &s, &l, d) == 3 &&
+                s == searcher && strncmp(d, "RESULT:F", 8) == 0)
+            {
+                strncpy(result, d, sizeof(result) - 1);
+                done = true;
+            }
+        }
+    }
+
+    lora_send(MASTER_ADDRESS, result);
+}
+
+
+/* =========================================================
+   CASE 2: HANDLE SEARCH PACKET (THIS NODE IS THE RELAY)
+
+   Probes each unresponded node ONE AT A TIME:
+     - send PROBE
+     - wait PROBE_TIMEOUT_MS for ACK_PROBE
+     - retry up to PROBE_MAX_RETRIES
+     - move to next target regardless of outcome
+   Then reports RESULT:F<found>:N<not_found> back to master.
+   ========================================================= */
+
+
+static void handle_search_packet(int requester,const char *search_payload)
+
+{
+
+    int targets[MAX_TARGETS];
+
+    int target_count = parse_target_list(search_payload, targets);
+
+    ESP_LOGI(
+
+        TAG,
+
+        "SEARCH received, %d target(s) to probe",
+
+        target_count
+
+    );
+
+    /* step 5 from your design: ack the search request right away */
+
+    lora_send(requester, "ACK_SEARCH");
+
+    int found[MAX_TARGETS];
+
+    int found_count = 0;
+
+    int not_found[MAX_TARGETS];
+
+    int not_found_count = 0;
+
+    for (int i = 0; i < target_count; i++)
+
+    {
+
+        int node_id = targets[i];
+
+        if (node_id == MY_ADDRESS)
+
+        {
+
+            continue; /* skip probing self */
+
+        }
+
+        bool acked = false;
+
+        for (int attempt = 1;
+
+             attempt <= PROBE_MAX_RETRIES && !acked;
+
+             attempt++)
+
+        {
+
+            ESP_LOGI(
+
+                TAG,
+
+                "Probing node %d (attempt %d/%d)",
+
+                node_id,
+
+                attempt,
+
+                PROBE_MAX_RETRIES
+
+            );
+
+            lora_send(node_id, "PROBE");
+            esp_rom_delay_us(2000);
+
+            
+            int64_t deadline_us = esp_timer_get_time() + (int64_t)PROBE_TIMEOUT_MS * 1000;
+            while (!acked && esp_timer_get_time() < deadline_us)
+            {
+                char line[256];
+                if (!wait_for_line(line, sizeof(line), 200))
+                continue;
+                int sender, length;
+                char data[100];
+                memset(data, 0, sizeof(data));
+                int r = sscanf(line, "+RCV=%d,%d,%99[^,]", &sender, &length, data);
+                if (r == 3 && sender == node_id && strcmp(data, "ACK_PROBE") == 0)
+                {
+                    acked = true;
+                }
+            }
+
+            
+
+        }
+
+        if (acked)
+
+        {
+
+            ESP_LOGI(TAG, "Node %d FOUND", node_id);
+
+            found[found_count++] = node_id;
+
+        }
+
+        else
+
+        {
+
+            ESP_LOGI(TAG, "Node %d NOT FOUND", node_id);
+
+            not_found[not_found_count++] = node_id;
+
+        }
+
+    }
+
+    /* build RESULT:F<ids>:N<ids> */
+
+    char result_msg[150];
+
+    int pos = snprintf(result_msg, sizeof(result_msg), "RESULT:F");
+
+    for (int i = 0; i < found_count; i++)
+
+    {
+
+        pos += snprintf(
+
+            result_msg + pos,
+
+            sizeof(result_msg) - pos,
+
+            ":%d",
+
+            found[i]
+
+        );
+
+    }
+
+    pos += snprintf(
+
+        result_msg + pos,
+
+        sizeof(result_msg) - pos,
+
+        ":N"
+
+    );
+
+    for (int i = 0; i < not_found_count; i++)
+
+    {
+
+        pos += snprintf(
+
+            result_msg + pos,
+
+            sizeof(result_msg) - pos,
+
+            ":%d",
+
+            not_found[i]
+
+        );
+
+    }
+
+    /* step 6: report back to master */
+
+    lora_send(requester, result_msg);
+
+}
+
+
+
+/* =========================================================
+   PROCESS RECEIVED LINE (MAIN LOOP PATH)
+   ========================================================= */
+
+static void process_received_line(char *line)
+{
+    int sender;
+    int length;
+
+    char data[128];
+
+    memset(
+        data,
+        0,
+        sizeof(data)
+    );
+
+    /*
+       Expected:
+
+       +RCV=4,9,DISCOVERY,...
+    */
+
+    int result = sscanf(
+        line,
+        "+RCV=%d,%d,%127[^,]",
+        &sender,
+        &length,
+        data
+    );
+    ESP_LOGI(TAG, "length=%d data='%s'", length, data);
+    if (result != 3)
+    {
+        return;
+    }
+
+    /* =====================================================
+       DISCOVERY -- only from master
+       ===================================================== */
+
+    if (sender == MASTER_ADDRESS &&
+        strcmp(data, "DISCOVERY") == 0)
+    {
+        ESP_LOGI(TAG, "DISCOVERY RECEIVED FROM MASTER");
+
+        uint32_t random_value = esp_random();
+
+        uint32_t backoff_time =
+            BACKOFF_MIN_MS +
+            (
+                random_value %
+                (
+                    BACKOFF_MAX_MS -
+                    BACKOFF_MIN_MS +
+                    1
+                )
+            );
+
+        ESP_LOGI(
+            TAG,
+            "Backoff = %lu ms",
+            (unsigned long)backoff_time
+        );
+
+        esp_rom_delay_us(backoff_time * 1000);
+
+        send_discovery_ack();
+        return;
+    }
+
+    /* =====================================================
+       SEARCH -- only from master, means WE are the relay
+       ===================================================== */
+
+    if (strncmp(data, "SEARCH", 6) == 0)
+    {
+        handle_search_packet(sender,data);
+        return;
+    }
+    
+
+    if (sender == MASTER_ADDRESS && strncmp(data, "FWDS=", 5) == 0)
+    {
+        handle_fwd_search(data);
+        return;
+    }
+    /* =====================================================
+       PROBE -- from ANY slave acting as relay, not master
+       ===================================================== */
+
+    if (sender != MASTER_ADDRESS &&
+        strcmp(data, "PROBE") == 0)
+    {
+        ESP_LOGI(
+            TAG,
+            "PROBE received from relay node %d",
+            sender
+        );
+
+        send_probe_ack(sender);
+        return;
+    }
+
+    /*
+       ACK_PROBE replies are consumed directly inside
+       handle_search_packet() via wait_for_line(), so they
+       are not expected to reach this function during a
+       normal search round.
+    */
+   /* Final receiver: master (direct) or a relay (forwarded) */
+   if (strncmp(data, "DATA=", 5) == 0)
+   {
+    ESP_LOGI(TAG, "DATA from %d: %s", sender, data + 5);
+    esp_rom_delay_us(5000);
+    lora_send(sender, "ACK_DATA");
+    return;
+    }
+
+/* Relay: forward master's data to the destination */
+   if (sender == MASTER_ADDRESS && strncmp(data, "FWD=", 4) == 0)
+   {
+    int dest = atoi(data + 4);
+    char *msg = strchr(data + 4, ':');
+
+    if (msg != NULL)
+      {
+        char out[150], res[24];
+        snprintf(out, sizeof(out), "DATA=%s", msg + 1);
+
+        bool ok = send_data_with_ack(dest, out);
+
+        snprintf(res, sizeof(res), ok ? "ACK_FWD=%d" : "FWD_FAIL=%d", dest);
+        lora_send(MASTER_ADDRESS, res);
+      }
+      return;
+    }
+}
+
+/* =========================================================
+   RECEIVE UART (MAIN LOOP POLLING)
+   ========================================================= */
+
+static void lora_receive(void)
+{
+    char line_buffer[256];
+
+    if (read_one_line(line_buffer, sizeof(line_buffer)))
+    {
+        process_received_line(line_buffer);
+    }
+}
+
+
+/* =========================================================
+   MAIN
+   ========================================================= */
+
+void app_main(void)
+{
+    ESP_LOGI(TAG, "==============================");
+    ESP_LOGI(TAG, "NORMAL NODE STARTING");
+    ESP_LOGI(TAG, "Node address = %d", MY_ADDRESS);
+    ESP_LOGI(TAG, "Master address = %d", MASTER_ADDRESS);
+    ESP_LOGI(TAG, "==============================");
+
+    lora_uart_init();
+
+    while (1)
+    {
+        lora_receive();
+        esp_rom_delay_us(10000);
+    }
+}
